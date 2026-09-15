@@ -261,6 +261,70 @@ def test_fused_mhc_sinkhorn_falls_back_when_grad_is_required():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("grad_context", [torch.inference_mode, torch.no_grad])
+def test_fused_mhc_sinkhorn_accepts_parameters_without_active_autograd(grad_context, monkeypatch):
+    """Model parameters keep requires_grad=True; inference contexts must fuse.
+
+    ``load_weights`` never clears the nn.Parameter flags, and neither does
+    inference_mode()/no_grad(), so eligibility keys on active autograd, not
+    on the flags themselves.
+    """
+    _clear_runtime_failure_cache()
+    launches = []
+    real_launch = mhc_fused._launch_fused_mhc_sinkhorn
+
+    def counting_launch(*args, **kwargs):
+        launches.append(1)
+        return real_launch(*args, **kwargs)
+
+    monkeypatch.setattr(mhc_fused, "_launch_fused_mhc_sinkhorn", counting_launch)
+    logits, alpha, bias = _make_inputs(128, 4, "cuda")
+    alpha_param = torch.nn.Parameter(alpha.detach().clone())
+    bias_param = torch.nn.Parameter(bias.detach().clone())
+    kwargs = dict(
+        matmul_scale=_MATMUL_SCALE,
+        iterations=_ITERATIONS,
+        epsilon=_EPSILON,
+        out_dtype=torch.bfloat16,
+    )
+
+    with grad_context():
+        fused = mhc_sinkhorn_matrix(logits, alpha_param, bias_param, **kwargs)
+    assert len(launches) == 1
+    assert not fused.requires_grad
+    reference = _reference(logits, alpha_param.detach(), bias_param.detach(), torch.bfloat16)
+    assert torch.equal(_bits(fused), _bits(reference))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_fused_mhc_sinkhorn_fuses_without_grad_tracing_when_grad_enabled(monkeypatch):
+    """Grad-enabled calls on inputs that need no tracing still take the kernel."""
+    _clear_runtime_failure_cache()
+    launches = []
+    real_launch = mhc_fused._launch_fused_mhc_sinkhorn
+
+    def counting_launch(*args, **kwargs):
+        launches.append(1)
+        return real_launch(*args, **kwargs)
+
+    monkeypatch.setattr(mhc_fused, "_launch_fused_mhc_sinkhorn", counting_launch)
+    logits, alpha, bias = _make_inputs(64, 4, "cuda")
+    assert torch.is_grad_enabled()
+    mhc_sinkhorn_matrix(
+        logits,
+        alpha,
+        bias,
+        matmul_scale=_MATMUL_SCALE,
+        iterations=_ITERATIONS,
+        epsilon=_EPSILON,
+        out_dtype=torch.bfloat16,
+    )
+    assert len(launches) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_fused_mhc_sinkhorn_caches_runtime_failure(monkeypatch):
     _clear_runtime_failure_cache()
     launches = []

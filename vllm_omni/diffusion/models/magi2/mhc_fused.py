@@ -39,14 +39,7 @@ from __future__ import annotations
 import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.triton_utils import HAS_TRITON, tl, triton
-
-try:
-    from triton.language.extra.libdevice import div_rn as _div_rn
-    from triton.language.extra.libdevice import exp as _libdevice_exp
-except ModuleNotFoundError:
-    from triton.language.extra.cuda.libdevice import div_rn as _div_rn
-    from triton.language.extra.cuda.libdevice import exp as _libdevice_exp
+from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 logger = init_logger(__name__)
 
@@ -126,7 +119,7 @@ def _mhc_sinkhorn_kernel(
     for i in tl.static_range(num_streams):
         row = ()
         for j in tl.static_range(num_streams):
-            row = row + (_libdevice_exp(m[i][j] - amax),)
+            row = row + (tldevice.exp(m[i][j] - amax),)
         new_m = new_m + (row,)
     m = new_m
 
@@ -143,7 +136,7 @@ def _mhc_sinkhorn_kernel(
         for i in tl.static_range(num_streams):
             row = ()
             for j in tl.static_range(num_streams):
-                row = row + (_div_rn(m[i][j], col_sum[j] + epsilon),)
+                row = row + (tldevice.div_rn(m[i][j], col_sum[j] + epsilon),)
             new_m = new_m + (row,)
         m = new_m
         # matrix / (matrix.sum(dim=-1, keepdim=True) + epsilon):
@@ -162,7 +155,7 @@ def _mhc_sinkhorn_kernel(
         for i in tl.static_range(num_streams):
             row = ()
             for j in tl.static_range(num_streams):
-                row = row + (_div_rn(m[i][j], row_sum[i] + epsilon),)
+                row = row + (tldevice.div_rn(m[i][j], row_sum[i] + epsilon),)
             new_m = new_m + (row,)
         m = new_m
 
@@ -205,9 +198,15 @@ def _can_use_fused_mhc_sinkhorn(
         and bias_residual.is_contiguous()
         and alpha_residual.is_contiguous()
         and out_dtype in _SUPPORTED_OUT_DTYPES
-        and not residual_logits.requires_grad
-        and not alpha_residual.requires_grad
-        and not bias_residual.requires_grad
+        # Only autograd that is actually active blocks the fused path.
+        # ``mhc_alpha_res_*``/``mhc_bias_res_*`` are nn.Parameters that keep
+        # their default requires_grad=True flag through load_weights; under
+        # inference_mode()/no_grad() (torch.is_grad_enabled() is False) their
+        # eager outputs carry no grad, so the fusion stays eligible.
+        and not (
+            torch.is_grad_enabled()
+            and (residual_logits.requires_grad or alpha_residual.requires_grad or bias_residual.requires_grad)
+        )
         and residual_logits.numel() > 0
         and residual_logits.numel() <= _MAX_INT32_INDEX
     )
