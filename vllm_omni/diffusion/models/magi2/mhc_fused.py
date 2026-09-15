@@ -79,6 +79,7 @@ def _mhc_sinkhorn_kernel(
     matmul_scale,
     epsilon,
     num_tokens,
+    logits_stride0,
     num_streams: tl.constexpr,
     iterations: tl.constexpr,
     tokens_per_program: tl.constexpr,
@@ -89,6 +90,13 @@ def _mhc_sinkhorn_kernel(
     t_mask = offs_t < num_tokens
     alpha = tl.load(alpha_ptr)
 
+    # ``compute_logits()`` hands the kernel a strided view of the
+    # [T, N*(N+2)] projection (stride (N*(N+2), N, 1)), so the token row
+    # stride is a runtime argument.  64-bit addressing: the row stride can
+    # push offsets past INT32 even when numel() fits the guard below.
+    offs_row = offs_t.to(tl.int64) * logits_stride0
+    offs_out = offs_t.to(tl.int64) * (num_streams * num_streams)
+
     # m[i][j]: one [TPB] vector per matrix element; m[i][j][t] = logits[t, i, j].
     # Triton's frontend models Python lists as immutable tuples, so updates
     # rebuild the tuples; every index below is a compile-time constant.
@@ -97,7 +105,7 @@ def _mhc_sinkhorn_kernel(
         row = ()
         for j in tl.static_range(num_streams):
             v = tl.load(
-                logits_ptr + offs_t * (num_streams * num_streams) + i * num_streams + j,
+                logits_ptr + offs_row + i * num_streams + j,
                 mask=t_mask,
                 other=0.0,
             )
@@ -167,7 +175,7 @@ def _mhc_sinkhorn_kernel(
             elif out_dtype_code == 2:
                 v = v.to(tl.float16)
             tl.store(
-                out_ptr + offs_t * (num_streams * num_streams) + i * num_streams + j,
+                out_ptr + offs_out + i * num_streams + j,
                 v,
                 mask=t_mask,
             )
@@ -194,7 +202,13 @@ def _can_use_fused_mhc_sinkhorn(
         and num_streams in _SUPPORTED_STREAMS
         and alpha_residual.numel() == 1
         and bias_residual.shape == (num_streams, num_streams)
-        and residual_logits.is_contiguous()
+        # ``compute_logits()`` returns the residual slice as a [T, N, N] view
+        # of the [T, N*(N+2)] projection with stride (N*(N+2), N, 1); the
+        # kernel takes the token stride as a runtime argument, so only the
+        # last two dims must be in standard layout.
+        and residual_logits.stride(2) == 1
+        and residual_logits.stride(1) == num_streams
+        and residual_logits.stride(0) >= 1
         and bias_residual.is_contiguous()
         and alpha_residual.is_contiguous()
         and out_dtype in _SUPPORTED_OUT_DTYPES
@@ -239,6 +253,7 @@ def _launch_fused_mhc_sinkhorn(
             matmul_scale,
             epsilon,
             tokens,
+            residual_logits.stride(0),
             num_streams=num_streams,
             iterations=iterations,
             tokens_per_program=_TOKENS_PER_PROGRAM,

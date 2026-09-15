@@ -12,6 +12,8 @@ from vllm_omni.diffusion.models.magi2 import mhc_fused
 from vllm_omni.diffusion.models.magi2.layers import MHCHandler, sinkhorn_knopp
 from vllm_omni.diffusion.models.magi2.mhc_fused import mhc_sinkhorn_matrix
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
+
 _MATMUL_SCALE = 1.0 / (4 * 3072) ** 0.5
 _ITERATIONS = 20
 _EPSILON = 1e-12
@@ -68,7 +70,9 @@ def _make_inputs(
 def test_fused_mhc_sinkhorn_is_bit_exact(tokens, num_streams, out_dtype):
     _clear_runtime_failure_cache()
     logits, alpha, bias = _make_inputs(tokens, num_streams, "cuda", seed=tokens * 31 + num_streams)
-    fused = mhc_sinkhorn_matrix(
+    # Call the launcher directly: a kernel that fails to compile or launch
+    # must fail the test instead of silently passing via eager fallback.
+    fused = mhc_fused._launch_fused_mhc_sinkhorn(
         logits,
         alpha,
         bias,
@@ -117,7 +121,8 @@ def test_fused_mhc_sinkhorn_special_values(out_dtype, magnitude):
         bias[0, 0] = float("inf")
         bias[1, 1] = float("nan")
 
-    fused = mhc_sinkhorn_matrix(
+    # Direct launcher call: kernel failures must fail, not fall back.
+    fused = mhc_fused._launch_fused_mhc_sinkhorn(
         logits,
         alpha,
         bias,
@@ -154,6 +159,52 @@ def test_fused_mhc_sinkhorn_dispatches_supported_inputs(monkeypatch):
         out_dtype=torch.bfloat16,
     )
     assert len(launches) == 1
+    # The launch must have succeeded: a caught failure would flip this cache.
+    assert not mhc_fused._FAILED_RUNTIME_KEYS
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_fused_mhc_sinkhorn_accepts_compute_logits_layout(monkeypatch):
+    """compute_logits() hands compute_post_residual() a strided view.
+
+    The residual slice of the [T, N*(N+2)] projection keeps stride
+    (N*(N+2), N, 1); the fused path must launch on it directly.
+    Regression: a full-tensor contiguity guard rejected every T > 1
+    production call.
+    """
+    _clear_runtime_failure_cache()
+    launches = []
+    real_launch = mhc_fused._launch_fused_mhc_sinkhorn
+
+    def counting_launch(*args, **kwargs):
+        launches.append(1)
+        return real_launch(*args, **kwargs)
+
+    monkeypatch.setattr(mhc_fused, "_launch_fused_mhc_sinkhorn", counting_launch)
+    tokens, num_streams = 97, 4
+    logits, alpha, bias = _make_inputs(tokens, num_streams, "cuda")
+    # Rebuild the exact layout compute_logits() produces: [T, N*(N+2)]
+    # projection, residual slice last, viewed back to [T, N, N].
+    projection = torch.zeros(tokens, num_streams * (num_streams + 2), device="cuda", dtype=torch.float32)
+    projection[:, 2 * num_streams :].copy_(logits.reshape(tokens, -1))
+    residual_view = projection[:, 2 * num_streams :].view(-1, num_streams, num_streams)
+    assert residual_view.stride() == (num_streams * (num_streams + 2), num_streams, 1)
+    assert not residual_view.is_contiguous()
+
+    fused = mhc_sinkhorn_matrix(
+        residual_view,
+        alpha,
+        bias,
+        matmul_scale=_MATMUL_SCALE,
+        iterations=_ITERATIONS,
+        epsilon=_EPSILON,
+        out_dtype=torch.bfloat16,
+    )
+    assert len(launches) == 1
+    assert not mhc_fused._FAILED_RUNTIME_KEYS
+    reference = _reference(logits, alpha, bias, torch.bfloat16)
+    assert torch.equal(_bits(fused), _bits(reference))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -291,6 +342,7 @@ def test_fused_mhc_sinkhorn_accepts_parameters_without_active_autograd(grad_cont
     with grad_context():
         fused = mhc_sinkhorn_matrix(logits, alpha_param, bias_param, **kwargs)
     assert len(launches) == 1
+    assert not mhc_fused._FAILED_RUNTIME_KEYS
     assert not fused.requires_grad
     reference = _reference(logits, alpha_param.detach(), bias_param.detach(), torch.bfloat16)
     assert torch.equal(_bits(fused), _bits(reference))
@@ -321,6 +373,7 @@ def test_fused_mhc_sinkhorn_fuses_without_grad_tracing_when_grad_enabled(monkeyp
         out_dtype=torch.bfloat16,
     )
     assert len(launches) == 1
+    assert not mhc_fused._FAILED_RUNTIME_KEYS
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -360,7 +413,10 @@ def test_mhc_handler_compute_post_residual_is_bit_exact(out_dtype, num_streams):
     handler = MHCHandler(num_streams, hidden, dtype=torch.float32)
     generator = torch.Generator(device="cuda").manual_seed(num_streams * 17)
     post_logits = torch.randn(tokens, num_streams, device="cuda", generator=generator)
-    residual_logits = torch.randn(tokens, num_streams, num_streams, device="cuda", generator=generator)
+    # Residual logits in the exact strided layout compute_logits() produces.
+    projection = torch.randn(tokens, num_streams * (num_streams + 2), device="cuda", generator=generator)
+    residual_logits = projection[:, 2 * num_streams :].view(-1, num_streams, num_streams)
+    assert not residual_logits.is_contiguous()
     alpha_post = torch.randn(1, device="cuda", generator=generator)
     bias_post = torch.randn(num_streams, device="cuda", generator=generator)
     alpha_res = torch.randn(1, device="cuda", generator=generator)
