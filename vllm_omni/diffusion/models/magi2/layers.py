@@ -19,7 +19,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .mhc_fused import mhc_sinkhorn_matrix
+from .mhc_fused import mhc_sinkhorn_matrix, sinkhorn_knopp
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
 
 
@@ -328,14 +328,6 @@ class ElementWiseFourierEmbed(nn.Module):
 
 
 MHCTensorTuple = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-
-
-def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float) -> torch.Tensor:
-    matrix = torch.exp(matrix_logits - matrix_logits.amax(dim=(-2, -1), keepdim=True))
-    for _ in range(iterations):
-        matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + epsilon)
-        matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + epsilon)
-    return matrix
 
 
 class MHCHandler:

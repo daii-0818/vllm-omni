@@ -9,8 +9,8 @@ import torch
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.models.magi2 import mhc_fused
-from vllm_omni.diffusion.models.magi2.layers import MHCHandler, sinkhorn_knopp
-from vllm_omni.diffusion.models.magi2.mhc_fused import mhc_sinkhorn_matrix
+from vllm_omni.diffusion.models.magi2.layers import MHCHandler
+from vllm_omni.diffusion.models.magi2.mhc_fused import mhc_sinkhorn_matrix, sinkhorn_knopp
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
 
@@ -275,8 +275,7 @@ def test_fused_mhc_sinkhorn_falls_back_for_unsupported_inputs(monkeypatch, unsup
     assert result.shape[:2] == (logits.shape[0], logits.shape[1])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.cpu
 def test_fused_mhc_sinkhorn_cpu_input_matches_eager_formula():
     logits, alpha, bias = _make_inputs(33, 4, "cpu")
     result = mhc_sinkhorn_matrix(
@@ -400,6 +399,31 @@ def test_fused_mhc_sinkhorn_caches_runtime_failure(monkeypatch):
     reference = _reference(logits, alpha, bias, torch.bfloat16)
     assert torch.equal(_bits(first), _bits(reference))
     assert torch.equal(_bits(second), _bits(reference))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_fused_mhc_sinkhorn_propagates_out_of_memory(monkeypatch):
+    """A transient CUDA OOM must propagate, not permanently disable fusion."""
+    _clear_runtime_failure_cache()
+
+    def oom_launch(*args, **kwargs):
+        raise torch.OutOfMemoryError("CUDA out of memory (simulated)")
+
+    monkeypatch.setattr(mhc_fused, "_launch_fused_mhc_sinkhorn", oom_launch)
+    logits, alpha, bias = _make_inputs(64, 4, "cuda")
+    with pytest.raises(torch.OutOfMemoryError):
+        mhc_sinkhorn_matrix(
+            logits,
+            alpha,
+            bias,
+            matmul_scale=_MATMUL_SCALE,
+            iterations=_ITERATIONS,
+            epsilon=_EPSILON,
+            out_dtype=torch.bfloat16,
+        )
+    # The failure cache stays empty: fusion remains eligible once memory frees.
+    assert not mhc_fused._FAILED_RUNTIME_KEYS
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

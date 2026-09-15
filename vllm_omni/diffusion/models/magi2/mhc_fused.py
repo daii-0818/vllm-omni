@@ -263,6 +263,19 @@ def _launch_fused_mhc_sinkhorn(
     return output
 
 
+def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float) -> torch.Tensor:
+    """Sinkhorn-Knopp normalization in the eager association order.
+
+    Defined here so both the eager fallback and ``layers`` share one
+    implementation without a module cycle.
+    """
+    matrix = torch.exp(matrix_logits - matrix_logits.amax(dim=(-2, -1), keepdim=True))
+    for _ in range(iterations):
+        matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + epsilon)
+        matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + epsilon)
+    return matrix
+
+
 def _eager_sinkhorn_matrix(
     residual_logits: torch.Tensor,
     alpha_residual: torch.Tensor,
@@ -274,9 +287,6 @@ def _eager_sinkhorn_matrix(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Mirror of ``MHCHandler.compute_post_residual``'s eager expression."""
-    # Imported lazily to avoid a module cycle with ``layers``.
-    from vllm_omni.diffusion.models.magi2.layers import sinkhorn_knopp
-
     return sinkhorn_knopp(
         alpha_residual * matmul_scale * residual_logits.float() + bias_residual.unsqueeze(0).float(),
         iterations,
@@ -328,6 +338,10 @@ def mhc_sinkhorn_matrix(
                 epsilon=epsilon,
                 out_dtype=out_dtype,
             )
+        except torch.OutOfMemoryError:
+            # Transient allocation failure: propagate instead of
+            # permanently disabling the fusion for this device/dtype.
+            raise
         except Exception as exc:
             _FAILED_RUNTIME_KEYS.add(runtime_key)
             logger.warning_once(
@@ -347,4 +361,4 @@ def mhc_sinkhorn_matrix(
     )
 
 
-__all__ = ["mhc_sinkhorn_matrix"]
+__all__ = ["mhc_sinkhorn_matrix", "sinkhorn_knopp"]
